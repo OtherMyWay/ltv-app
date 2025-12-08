@@ -2,6 +2,7 @@
 
 import fetch from 'node-fetch';
 import { URL } from 'url'; // 使用 Node.js 内置 URL 处理
+import crypto from 'crypto'; // 导入 crypto 模块用于密码哈希
 
 // --- 配置 (从环境变量读取) ---
 const DEBUG_ENABLED = process.env.DEBUG === 'true';
@@ -299,6 +300,40 @@ async function processMasterPlaylist(url, content, recursionDepth) {
     return await processM3u8Content(bestVariantUrl, variantContent, recursionDepth + 1);
 }
 
+/**
+ * 验证代理请求的鉴权
+ */
+async function validateAuth(req) {
+    const authHash = req.query.auth;
+    const timestamp = req.query.t;
+    
+    // 获取服务器端密码哈希
+    const serverPassword = process.env.PASSWORD;
+    if (!serverPassword) {
+        console.error('服务器未设置 PASSWORD 环境变量，代理访问被拒绝');
+        return false;
+    }
+    
+    // 使用 crypto 模块计算 SHA-256 哈希
+    const serverPasswordHash = crypto.createHash('sha256').update(serverPassword).digest('hex');
+    
+    if (!authHash || authHash !== serverPasswordHash) {
+        console.warn('代理请求鉴权失败：密码哈希不匹配');
+        return false;
+    }
+    
+    // 验证时间戳（10分钟有效期）
+    if (timestamp) {
+        const now = Date.now();
+        const maxAge = 10 * 60 * 1000; // 10分钟
+        if (now - parseInt(timestamp) > maxAge) {
+            console.warn('代理请求鉴权失败：时间戳过期');
+            return false;
+        }
+    }
+    
+    return true;
+}
 
 // --- Vercel Handler 函数 ---
 export default async function handler(req, res) {
@@ -325,47 +360,48 @@ export default async function handler(req, res) {
 
     try { // ---- 开始主处理逻辑的 try 块 ----
 
-    // --- 提取目标 URL ---
-    // Vercel 将 :path* 捕获的内容放入 req.query.path (如果路由是 /proxy/:path*)
-    // 或者放入 req.query["...path"] (如果路由是 /proxy/[...path].js 这样的文件名路由)
-    // 我们需要同时检查这两种可能性。
-
-    let encodedUrlPath = '';
-    const queryPathData = req.query.path; // 对应 :path*
-    const spreadPathData = req.query["...path"]; // 对应 [...path].js 文件名
-
-    if (queryPathData) {
-        if (Array.isArray(queryPathData)) {
-            encodedUrlPath = queryPathData.join('/');
-            console.info(`从 req.query.path (数组) 组合的编码路径: ${encodedUrlPath}`);
-        } else if (typeof queryPathData === 'string') {
-            encodedUrlPath = queryPathData;
-            console.info(`从 req.query.path (字符串) 获取的编码路径: ${encodedUrlPath}`);
+        // --- 验证鉴权 ---
+        const isAuthorized = await validateAuth(req);
+        if (!isAuthorized) {
+            console.warn('代理请求鉴权失败');
+            res.status(401).json({
+                success: false,
+                error: '代理访问未授权：请检查密码配置或鉴权参数'
+            });
+            return;
         }
-    } else if (spreadPathData) {
-        if (Array.isArray(spreadPathData)) {
-            encodedUrlPath = spreadPathData.join('/');
-            console.info(`从 req.query["...path"] (数组) 组合的编码路径: ${encodedUrlPath}`);
-        } else if (typeof spreadPathData === 'string') {
-            encodedUrlPath = spreadPathData;
-            console.info(`从 req.query["...path"] (字符串) 获取的编码路径: ${encodedUrlPath}`);
-        }
-    } else {
-        console.warn(`[代理警告] req.query.path 和 req.query["...path"] 均为空或未定义。`);
-        // 备选：尝试从 req.url 提取（如果需要）
-        if (req.url && req.url.startsWith('/proxy/')) {
-            encodedUrlPath = req.url.substring('/proxy/'.length);
-            console.info(`使用备选方法从 req.url 提取的编码路径: ${encodedUrlPath}`);
-        }
-    }
 
-    // 如果仍然为空，则无法继续
-    if (!encodedUrlPath) {
-         throw new Error("无法从请求中确定编码后的目标路径。");
-    }
+        // --- 提取目标 URL (主要依赖 req.query["...path"]) ---
+        // Vercel 将 :path* 捕获的内容（可能包含斜杠）放入 req.query["...path"] 数组
+        const pathData = req.query["...path"]; // 使用正确的键名
+        let encodedUrlPath = '';
 
-    // 解析目标 URL
-    targetUrl = getTargetUrlFromPath(encodedUrlPath);
+        if (pathData) {
+            if (Array.isArray(pathData)) {
+                encodedUrlPath = pathData.join('/'); // 重新组合
+                console.info(`从 req.query["...path"] (数组) 组合的编码路径: ${encodedUrlPath}`);
+            } else if (typeof pathData === 'string') {
+                encodedUrlPath = pathData; // 也处理 Vercel 可能只返回字符串的情况
+                console.info(`从 req.query["...path"] (字符串) 获取的编码路径: ${encodedUrlPath}`);
+            } else {
+                console.warn(`[代理警告] req.query["...path"] 类型未知: ${typeof pathData}`);
+            }
+        } else {
+            console.warn(`[代理警告] req.query["...path"] 为空或未定义。`);
+            // 备选：尝试从 req.url 提取（如果需要）
+            if (req.url && req.url.startsWith('/proxy/')) {
+                encodedUrlPath = req.url.substring('/proxy/'.length);
+                console.info(`使用备选方法从 req.url 提取的编码路径: ${encodedUrlPath}`);
+            }
+        }
+
+        // 如果仍然为空，则无法继续
+        if (!encodedUrlPath) {
+             throw new Error("无法从请求中确定编码后的目标路径。");
+        }
+
+        // 解析目标 URL
+        targetUrl = getTargetUrlFromPath(encodedUrlPath);
         console.info(`解析出的目标 URL: ${targetUrl || 'null'}`); // 记录解析结果
 
         // 检查目标 URL 是否有效
